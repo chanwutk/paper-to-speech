@@ -1,10 +1,117 @@
-import multiprocessing
 import os
 import argparse
+from typing import TYPE_CHECKING
+
+
+import numpy as np
+
+if TYPE_CHECKING:
+    from torch.multiprocessing import Queue
 
 
 def process_text(text: str):
     return "\n\n".join(p.replace("\n", " ") for p in text.split("\n\n"))
+
+
+def chunks(lst, n):
+    n = len(lst) // n
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
+
+
+def split_text(text: str, chunk_count: int) -> list[str]:
+    from TTS.utils.synthesizer import Synthesizer
+
+    segmenter = Synthesizer._get_segmenter('en')
+    sens = segmenter.segment(text)
+    assert isinstance(sens, list)
+    return [
+        "\n".join(chunk)
+        for chunk
+        in chunks(sens, chunk_count)
+    ]
+
+
+def tts_chunk(
+    rank: int,
+    texts: list[str],
+    queues: "list[Queue]",
+    emotion: str,
+    speaker: str | None = None,
+    speaker_wav: str | None = None
+):
+    import torch
+
+    torch.cuda.set_device(rank)
+    queue = queues[rank]
+    text = texts[rank]
+
+    from TTS.api import TTS
+    from TTS.utils.synthesizer import Synthesizer
+
+    # print('Initializing Model')
+    tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2", gpu=torch.cuda.is_available())
+
+    # print('Generating Voice')
+    if speaker_wav is not None:
+        queue.put(tts.tts(
+            text=text,
+            language="en",
+            emotion=emotion,
+            speaker_wav=speaker_wav,
+        ))
+    else:
+        queue.put(tts.tts(
+            text=text,
+            language="en",
+            emotion=emotion,
+            speaker=speaker or "Tanja Adelina",
+        ))
+    synthesizer = tts.synthesizer
+    assert isinstance(synthesizer, Synthesizer)
+    queue.put(synthesizer.output_sample_rate)
+    return
+
+
+def tts_to_file(text: str, output_path: str, emotion: str, speaker: str | None = None, speaker_wav: str | None = None):
+    text = process_text(text)
+
+    import torch
+    import torch.multiprocessing as mp
+    import torch.multiprocessing.spawn
+    from TTS.utils.audio.numpy_transforms import save_wav
+
+    if torch.cuda.is_available():
+        device_count = torch.cuda.device_count()
+    else:
+        device_count = 1
+    torch.cuda.empty_cache()
+
+    qs = [mp.Queue(2) for _ in range(device_count)]
+    texts = split_text(text, device_count)
+    context = torch.multiprocessing.spawn(
+        tts_chunk,
+        args=(texts, qs, emotion, speaker, speaker_wav),
+        nprocs=device_count,
+        join=False
+    )
+
+    wav: list[int] = []
+    sample_rate = None
+    for q in qs:
+        w, _sample_rate = q.get(), q.get()
+        wav += list(w) + [0] * 10000
+
+        if sample_rate is None:
+            sample_rate = _sample_rate
+        else:
+            assert sample_rate == _sample_rate, (sample_rate, _sample_rate)
+    
+    assert context is not None
+    context.join(1)
+
+    assert isinstance(sample_rate, int)
+    save_wav(wav=np.array(wav), path=output_path, sample_rate=sample_rate)
 
 
 def main():
@@ -37,31 +144,16 @@ def main():
             "Our results using real world videos and workflows show that Spatialyze can reduce execution time by up to 5.3 time, while maintaining up to 97.1% accuracy compared to unoptimized execution."
 
     import torch
-    from TTS.api import TTS
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    torch.cuda.empty_cache()
 
-    print('Initializing Model')
-    tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(device)
-
-    def tts_to_file(text, output_path):
-        tts.tts_to_file(
-            text=process_text(text),
-            language="en",
-            file_path=output_path,
-            emotion=args.emotion,
-            speaker=args.speaker or "Tanja Adelina",
-        )
-
-    print('Generating Voice')
+    torch.multiprocessing.set_start_method('spawn')
     if args.dir is None:
-        tts_to_file(args.text, args.output)
+        tts_to_file(args.text, args.output, args.emotion, args.speaker)
     else:
         for filename in sorted(os.listdir(args.dir)):
             path = os.path.join(args.dir, filename)
             with open(path, 'r') as f:
-                tts_to_file(f.read(), path + '.wav')
+                tts_to_file(f.read(), path + '.wav', args.emotion, args.speaker)
 
 
 if __name__ == '__main__':
