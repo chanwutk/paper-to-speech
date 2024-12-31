@@ -4,7 +4,6 @@ import random
 from multiprocessing import Process
 from typing import TYPE_CHECKING
 
-
 import numpy as np
 
 if TYPE_CHECKING:
@@ -16,9 +15,15 @@ def process_text(text: str):
 
 
 def chunks(lst, n):
-    n = len(lst) // n
-    for i in range(0, len(lst), n):
-        yield lst[i:i + n]
+    if n > len(lst):
+        for s in lst:
+            yield [s]
+        for _ in range(n - len(lst)):
+            yield []
+    else:
+        n = len(lst) // n
+        for i in range(0, len(lst), n):
+            yield lst[i:i + n]
 
 
 def split_text(text: str, chunk_count: int) -> list[str]:
@@ -38,82 +43,137 @@ def tts_chunk(
     rank: int,
     input_queues: "list[Queue]",
     output_queues: "list[Queue]",
+    usable_devices: list[int],
     emotion: str,
     speaker: str | None = None,
     speaker_wav: str | None = None
 ):
-    import torch
+    with open(f'./tts_chunk_{rank}.log', 'w') as f:
+        import torch
 
-    input_queue = input_queues[rank]
-    output_queue = output_queues[rank]
+        f.write('Rank: ' + str(rank) + '\n')
+        f.write('Usable Devices: ' + str(usable_devices) + '\n')
+        f.flush()
+        cuda_rank = usable_devices[rank]
 
-    from TTS.api import TTS
-    from TTS.utils.synthesizer import Synthesizer
+        f.write('Starting TTS Chunk\n')
+        f.flush()
+        input_queue = input_queues[rank]
+        output_queue = output_queues[rank]
 
-    # print('Initializing Model')
-    device = f"cuda:{rank}" if torch.cuda.is_available() else "cpu"
-    tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(device)
+        f.write('Importing TTS\n')
+        f.flush()
+        from TTS.api import TTS
+        from TTS.utils.synthesizer import Synthesizer
+        f.write('Imported TTS\n')
 
-    synthesizer = tts.synthesizer
-    assert isinstance(synthesizer, Synthesizer)
+        f.write('Initializing Model\n')
+        f.flush()
+        # print('Initializing Model')
+        device = f"cuda:{cuda_rank}" if torch.cuda.is_available() else "cpu"
+        tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(device)
+        f.write('Initialized Model\n')
+        f.flush()
 
-    while True:
-        input_values = input_queue.get()
-        if input_values is None:
-            break
+        synthesizer = tts.synthesizer
+        assert isinstance(synthesizer, Synthesizer)
 
-        text, output_path, idx = input_values
+        f.write('Starting Loop\n')
+        f.flush()
+        while True:
+            f.write('Waiting for input values\n')
+            f.flush()
+            input_values = input_queue.get()
+            f.write('Got input values\n')
+            f.flush()
+            if input_values is None:
+                f.write('Got None input values\n')
+                break
 
-        # print('Generating Voice')
-        if speaker_wav is not None:
-            wav = tts.tts(
-                text=text,
-                language="en",
-                emotion=emotion,
-                speaker_wav=speaker_wav,
-            )
-        else:
-            wav = tts.tts(
-                text=text,
-                language="en",
-                emotion=emotion,
-                speaker=speaker or "Tanja Adelina",
-            )
-        output_queue.put((wav, synthesizer.output_sample_rate, output_path, idx))
-    
-    output_queue.put(None)
+            text, output_path, idx = input_values
+
+            f.write('Processing Text\n')
+            f.flush()
+            # print('Generating Voice')
+            if speaker_wav is not None:
+                wav = tts.tts(
+                    text=text,
+                    language="en",
+                    emotion=emotion,
+                    speaker_wav=speaker_wav,
+                )
+            else:
+                wav = tts.tts(
+                    text=text,
+                    language="en",
+                    emotion=emotion,
+                    speaker=speaker or "Tanja Adelina",
+                )
+            f.write('Processed Text\n')
+            f.flush()
+
+            f.write('Putting Output Values\n')
+            f.flush()
+            output_queue.put((wav, synthesizer.output_sample_rate, output_path, idx))
+            f.write('Put Output Values\n')
+            f.flush()
+        
+        f.write('Putting None Output Values\n')
+        f.flush()
+        output_queue.put(None)
+        f.write('Put None Output Values\n')
+        f.flush()
 
 
 def waves_to_file(output_queues: "list[Queue]"):
-    while True:
-        waves: list[tuple[int, list[int]]] = []
-        sample_rate = None
-        output_path = None
-        output_values = [q.get() for q in output_queues]
+    with open('waves_to_file.log', 'w') as f:
+        while True:
+            waves: list[tuple[int, list[int]]] = []
+            sample_rate = None
+            output_path = None
+            f.write('Waiting for output values\n')
+            f.flush()
+            output_values = [q.get() for q in output_queues]
+            f.write('Got output values\n')
+            f.flush()
 
-        if all(v is None for v in output_values):
-            return
+            if all(v is None for v in output_values):
+                return
 
-        assert all(v is not None for v in output_values)
-        for w, _sample_rate, _output_path, _idx in output_values:
-            if output_path is None:
-                output_path = _output_path
-            assert _output_path == output_path, (output_path, _output_path)
+            assert all(v is not None for v in output_values)
+            f.write('Processing output values\n')
+            f.flush()
+            for w, _sample_rate, _output_path, _idx in output_values:
+                f.write(f'Processing output value {_idx}\n')
+                f.flush()
+                if output_path is None:
+                    output_path = _output_path
+                assert _output_path == output_path, (output_path, _output_path)
 
-            waves.append((_idx, w))
+                waves.append((_idx, w))
 
-            if sample_rate is None:
-                sample_rate = _sample_rate
-            assert sample_rate == _sample_rate, (sample_rate, _sample_rate)
-        
-        wav: list[int] = []
-        for _, w in sorted(waves):
-            wav += list(w) + [0] * 10000
-        
-        from TTS.utils.audio.numpy_transforms import save_wav
-        assert isinstance(sample_rate, int)
-        assert isinstance(output_path, str)
-        save_wav(wav=np.array(wav), path=output_path, sample_rate=sample_rate)
+                if sample_rate is None:
+                    sample_rate = _sample_rate
+                assert sample_rate == _sample_rate, (sample_rate, _sample_rate)
+            f.write('Processed output values\n')
+            f.flush()
+            
+            f.write('Sorting waves\n')
+            f.flush()
+            wav: list[int] = []
+            for _, w in sorted(waves):
+                wav += list(w) + [0] * 10000
+            f.write('Sorted waves\n')
+            f.flush()
+            
+            f.write('Saving wav\n')
+            f.flush()
+            from TTS.utils.audio.numpy_transforms import save_wav
+            assert isinstance(sample_rate, int)
+            assert isinstance(output_path, str)
+            save_wav(wav=np.array(wav), path=output_path, sample_rate=sample_rate)
+            f.write('Saved wav\n')
+            f.flush()
 
 
 class TTSToFile:
@@ -127,7 +187,11 @@ class TTSToFile:
         import torch.multiprocessing as mp
 
         if torch.cuda.is_available():
-            self.device_count = torch.cuda.device_count()
+            self.usable_devices = []
+            for i in range(torch.cuda.device_count()):
+                if torch.cuda.mem_get_info(i)[0] > 3 * (1024 ** 3):
+                    self.usable_devices.append(i)
+            self.device_count = len(self.usable_devices)
         else:
             self.device_count = 1
         torch.cuda.empty_cache()
@@ -136,13 +200,13 @@ class TTSToFile:
         self.input_queues = [mp.Queue() for _ in range(self.device_count)]
         context = mp.spawn(
             tts_chunk,
-            args=(self.input_queues, self.output_queues, emotion, speaker, speaker_wav),
+            args=(self.input_queues, self.output_queues, self.usable_devices, emotion, speaker, speaker_wav),
             nprocs=self.device_count,
             join=False
         )
         assert context is not None
         self.context = context
-        self.writer = Process(target=waves_to_file, args=(self.output_queues,))
+        self.writer = Process(target=waves_to_file, args=(self.output_queues))
         self.writer.start()
     
     def tts_to_file(self, text: str, output_path: str):
